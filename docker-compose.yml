@@ -1,6 +1,10 @@
 # 🌸 Cherry — Docker Compose
 # Run from /Users/rajatpoddar/Developer/development/mybuffy/cherry
 # Usage: docker compose up -d
+#
+# For NAS deploy (recommended): use host network so backend can reach Ollama
+# running on the NAS host (host.docker.internal does NOT work on Synology DSM).
+# Both services use host network; ports 3000 + 3003 bind directly to NAS IP.
 
 version: '3.8'
 
@@ -9,8 +13,7 @@ services:
     build: ./backend
     container_name: cherry-backend
     restart: unless-stopped
-    ports:
-      - "3003:3003"
+    network_mode: host
     volumes:
       - ./data:/app/data          # SQLite memory persists
       - ./logs:/app/logs
@@ -20,33 +23,24 @@ services:
     environment:
       - CHERRY_HOST=0.0.0.0
       - CHERRY_PORT=3003
-      # On NAS, use localhost Ollama
-      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+      # On NAS, Ollama runs on host. ${OLLAMA_HOST} is set in .env
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://localhost:11434}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3003/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
-    networks:
-      - cherry-net
-    # For NAS: use host network so Docker can reach Ollama on host
-    # network_mode: host  # uncomment for NAS deploy
+      start_period: 15s
 
   cherry-frontend:
     build: ./frontend
     container_name: cherry-frontend
     restart: unless-stopped
-    ports:
-      - "3000:3000"
+    network_mode: host
     environment:
       - NODE_ENV=production
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
     depends_on:
       cherry-backend:
         condition: service_healthy
-    networks:
-      - cherry-net
-
-networks:
-  cherry-net:
-    driver: bridge
