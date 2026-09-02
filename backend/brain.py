@@ -115,6 +115,134 @@ class CherryBrain:
 
         return "\n".join(context_parts) if context_parts else ""
 
+    def _detect_server_intent(self, user_message: str) -> Optional[Dict]:
+        """
+        Detect if user is asking something Cherry can answer by running
+        a server command. Returns {"label": str} or None.
+
+        Cherry is deployed ON the same NAS as the 46+ services, so she should
+        just run these herself — not ask the user to run them.
+        """
+        msg = user_message.lower().strip()
+
+        if any(p in msg for p in [
+            "kitne docker", "kitne container", "docker containers",
+            "sabka overview", "sabhi container", "docker ps", "containers list",
+            "total containers", "how many containers", "running containers",
+            "docker stats", "container stats", "resource usage",
+        ]):
+            return {"label": "docker_ps"}
+
+        if any(p in msg for p in [
+            "disk", "space", "kitni jagah", "storage", "kitni space",
+            "disk usage", "disk full", "/ full", "volume",
+        ]):
+            return {"label": "disk"}
+
+        if any(p in msg for p in [
+            "ram", "memory", "kitna memory", "kitna ram", "free -h",
+            "memory usage", "kitni ram",
+        ]):
+            return {"label": "memory"}
+
+        if any(p in msg for p in [
+            "uptime", "kab se chal", "server kab se", "load average", "cpu load",
+        ]):
+            return {"label": "uptime"}
+
+        if any(p in msg for p in [
+            "ollama", "models", "kitne model", "which model", "llm models",
+        ]):
+            return {"label": "ollama"}
+
+        if any(p in msg for p in [
+            "production health", "prod health", "sab healthy", "sab theek",
+            "production status", "all services", "sab chal raha",
+            "unhealthy", "koi down to nahi",
+        ]):
+            return {"label": "prod_health"}
+
+        if any(p in msg for p in [
+            "server status", "server overview", "server ki health",
+            "server ka status", "server theek", "server healthy",
+            "system status", "system overview",
+        ]):
+            return {"label": "system_status"}
+
+        return None
+
+    def _fetch_server_data(self, intent: Dict) -> str:
+        """
+        Actually run the server query and return formatted text for the LLM.
+        This is what makes Cherry a real server assistant, not a chatbot.
+        """
+        from server_ops import get_ops
+        ops = get_ops()
+        label = intent["label"]
+
+        try:
+            if label == "docker_ps":
+                r = ops.docker_ps()
+                if r.get("success"):
+                    return f"Running `docker ps -a` on this server:\n```\n{r['output']}\n```"
+                return f"docker ps failed: {r.get('error', 'unknown error')}"
+
+            if label == "disk":
+                r = ops.execute_read("df -h")
+                if r.get("success"):
+                    return f"Disk usage (`df -h`):\n```\n{r['output']}\n```"
+                return f"df -h failed: {r.get('error', 'unknown error')}"
+
+            if label == "memory":
+                r = ops.execute_read("free -h")
+                if r.get("success"):
+                    return f"Memory usage (`free -h`):\n```\n{r['output']}\n```"
+                return f"free -h failed: {r.get('error', 'unknown error')}"
+
+            if label == "uptime":
+                r = ops.execute_read("uptime")
+                if r.get("success"):
+                    return f"Server uptime:\n```\n{r['output']}\n```"
+                return f"uptime failed: {r.get('error', 'unknown error')}"
+
+            if label == "ollama":
+                r = ops.ollama_status()
+                if r.get("success"):
+                    return f"Ollama at {r.get('host')}: {r.get('status')}. Models: {', '.join(r.get('models', []))}"
+                return f"Ollama check failed: {r.get('error', 'unknown')}"
+
+            if label == "prod_health":
+                h = ops.check_production_health()
+                lines = [f"Running containers: {h.get('running_count')}"]
+                crit = h.get("critical_health", {})
+                if crit:
+                    lines.append("Critical services:")
+                    for svc, state in crit.items():
+                        emoji = "✅" if state == "running" else "❌"
+                        lines.append(f"  {emoji} {svc}: {state}")
+                return "\n".join(lines)
+
+            if label == "system_status":
+                ps = ops.docker_ps()
+                disk = ops.execute_read("df -h")
+                mem = ops.execute_read("free -h")
+                up = ops.execute_read("uptime")
+                out = []
+                if ps.get("success"):
+                    containers = [l for l in ps["output"].splitlines() if l.strip() and not l.startswith("NAMES")]
+                    out.append(f"Running containers: {len(containers)}")
+                if disk.get("success"):
+                    out.append(f"Disk:\n{disk['output']}")
+                if mem.get("success"):
+                    out.append(f"Memory:\n{mem['output']}")
+                if up.get("success"):
+                    out.append(f"Uptime: {up['output'].strip()}")
+                return "\n\n".join(out) if out else "server_ops returned no data"
+        except Exception as e:
+            return f"server_ops error: {e}"
+
+        return ""
+
     def think(self, user_message: str) -> Dict:
         """
         Main thinking function — Cherry ki poori process.
@@ -141,12 +269,25 @@ class CherryBrain:
             mood=mood, time_of_day=time_of_day
         )
 
+        # Step 2.5: Server intent detection + execution.
+        # Cherry is deployed on the same NAS as the services — so she runs the
+        # command herself and feeds the real output to the LLM. No more
+        # "mujhe access nahi hai" replies.
+        server_data = ""
+        server_intent = self._detect_server_intent(user_message)
+        if server_intent:
+            try:
+                server_data = self._fetch_server_data(server_intent)
+            except Exception as e:
+                server_data = f"(server_ops call failed: {e})"
+
         # Step 3: Build system prompt
         user_context = self._build_user_context(user_message=user_message)
         system_prompt = build_system_prompt(
             mood=mood,
             time_of_day=time_of_day,
-            user_context=user_context
+            user_context=user_context,
+            server_data=server_data
         )
 
         # Safety guard for technical/server messages
