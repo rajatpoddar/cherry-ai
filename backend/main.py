@@ -107,7 +107,7 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
-    user_id: str = "rajjoo"
+    user_id: Optional[str] = None  # NEW: optional, auto-detect if not given
 
 
 class FeedbackRequest(BaseModel):
@@ -146,11 +146,75 @@ async def root():
 # ============================================================
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    """
+    Chat endpoint — user-aware.
+    Flow:
+    1. Identify user (user_id given OR auto-create from device fingerprint)
+    2. If user is new (onboarded=0) → send onboarding greeting, extract info from message
+    3. Else: normal chat with user profile context
+    """
+    import user_manager
+    from user_manager import (
+        get_or_create_user, update_user_profile, is_onboarding_complete,
+        extract_user_info_from_message
+    )
+
     brain = get_brain()
-    if req.session_id:
-        brain.session_id = req.session_id
-    else:
-        brain.start_session()
+
+    # ── Step 1: Identify user ──
+    user_id = req.user_id or req.session_id or "guest"
+    user = get_or_create_user(user_id)
+
+    # Tie session to user
+    if not brain.current_user or brain.current_user.get("user_id") != user_id:
+        brain.set_user(user_id)
+        if req.session_id:
+            brain.session_id = req.session_id
+
+    # ── Step 2: Onboarding flow ──
+    if not is_onboarding_complete(user):
+        # Try to extract name from current message
+        extracted = extract_user_info_from_message(req.message)
+        if extracted.get("display_name"):
+            # User ne apna naam batadiya — onboard karo with default nicknames
+            update_kwargs = {
+                "display_name": extracted["display_name"],
+                "pronouns": "she/her",
+                "relationship": "friend",
+                "vibe": "girl-girl bestie — warm, playful, caring, gossip-y",
+                "mode": "friend",
+                "nicknames": ["baby", "jaan", "sweetie"],  # common words allowed
+                "onboarded": 1
+            }
+            # If message mentions "Anushka" or "Patil", save nicknames
+            msg_lower = req.message.lower()
+            if "anushka" in msg_lower:
+                update_kwargs["nicknames"] = ["baby", "jaan", "Anu", "Patil ji", "sweetie"]
+            user = update_user_profile(user_id, **update_kwargs)
+            brain.current_user = user
+
+            # Return onboarding complete greeting
+            return {
+                "response": f"Arey {extracted['display_name']}! Tera naam sun ke accha laga 🐱 Ab toh hum bestie ban gaye! Kya haal hai? Sab bata, time hai mera! 😽✨",
+                "mood": "happy",
+                "session_id": brain.session_id,
+                "user_id": user_id,
+                "display_name": extracted["display_name"],
+                "onboarded": True,
+                "time_of_day": get_time_of_day()
+            }
+        else:
+            # Still onboarding — send greeting asking for name
+            return {
+                "response": user_manager.get_onboarding_greeting(),
+                "mood": "playful",
+                "session_id": brain.session_id,
+                "user_id": user_id,
+                "onboarded": False,
+                "time_of_day": get_time_of_day()
+            }
+
+    # ── Step 3: Normal chat ──
     result = brain.think(req.message)
     return {
         "response": result["response"],
@@ -159,13 +223,68 @@ async def chat(req: ChatRequest):
         "session_id": result["session_id"],
         "message_id": result["message_id"],
         "time_of_day": result["time_of_day"],
+        "user_id": user_id,
+        "display_name": user.get("display_name"),
         "llm_provider": result.get("llm_provider", "unknown"),
         "facts_extracted": result.get("facts_extracted", [])
     }
 
 
+# ============================================================
+# 👤 USER MANAGEMENT ENDPOINTS
+# ============================================================
+@app.get("/users")
+async def list_all_users():
+    """List all users Cherry knows about."""
+    from user_manager import list_users
+    return {"users": list_users()}
+
+
+@app.get("/users/{user_id}")
+async def get_user_info(user_id: str):
+    """Get a specific user's profile."""
+    from user_manager import get_user
+    user = get_user(user_id)
+    if not user:
+        return {"error": "user not found"}
+    return {"user": user}
+
+
+@app.post("/users/{user_id}/update")
+async def update_user_endpoint(user_id: str, body: dict):
+    """
+    Update user profile fields.
+    Body: {"display_name": "...", "nicknames": [...], "vibe": "...", "facts": {...}}
+    """
+    from user_manager import update_user_profile
+    user = update_user_profile(user_id, **body)
+    return {"success": True, "user": user}
+
+
+@app.delete("/users/{user_id}")
+async def delete_user_endpoint(user_id: str):
+    """Delete user and all their data."""
+    from user_manager import delete_user
+    delete_user(user_id)
+    return {"success": True, "deleted": user_id}
+
+
 @app.get("/chat/history")
-async def chat_history(session_id: str, limit: int = 50):
+async def chat_history(session_id: Optional[str] = None, user_id: Optional[str] = None, limit: int = 50):
+    """
+    Fetch chat history.
+    Either session_id OR user_id (fetches all sessions for that user).
+    """
+    from memory import get_chat_history
+    from user_manager import get_user_session_id
+
+    if user_id and not session_id:
+        # Fetch all sessions for this user
+        session_id = get_user_session_id(user_id)
+
+    if not session_id:
+        return {"messages": []}
+
     return {"messages": get_chat_history(session_id, limit)}
 
 
@@ -319,8 +438,44 @@ Start by exploring the project, then make changes, then verify."""
 
 
 @app.get("/greeting")
-async def greeting():
+async def greeting(user_id: Optional[str] = None):
+    """
+    User-aware greeting.
+    - No user_id / new user → onboarding greeting
+    - Existing user → returning personalized greeting
+    """
+    import user_manager
+    from user_manager import get_or_create_user, is_onboarding_complete, get_returning_greeting
+
     brain = get_brain()
+
+    # If user_id given, tie to user
+    if user_id:
+        user = get_or_create_user(user_id)
+        brain.current_user = user
+        brain.current_user_id = user_id
+
+        if not is_onboarding_complete(user):
+            return {
+                "greeting": user_manager.get_onboarding_greeting(),
+                "time_of_day": get_time_of_day(),
+                "mood": "playful",
+                "onboarded": False,
+                "user_id": user_id
+            }
+        else:
+            # Returning user
+            brain.set_user(user_id)
+            return {
+                "greeting": get_returning_greeting(user),
+                "time_of_day": get_time_of_day(),
+                "mood": "happy",
+                "onboarded": True,
+                "user_id": user_id,
+                "display_name": user.get("display_name")
+            }
+
+    # No user_id (legacy mode — Rajjoo)
     return {
         "greeting": brain.get_greeting(),
         "time_of_day": get_time_of_day(),
@@ -476,15 +631,27 @@ async def server_status():
 async def telegram_status():
     """Health check for the Telegram bridge."""
     try:
-        from telegram_bot import get_telegram_bot
+        from telegram_bot import get_telegram_bot, TELEGRAM_AVAILABLE
         bot = get_telegram_bot()
-        return {
+        info = {
+            "lib_available": TELEGRAM_AVAILABLE,
+            "has_token": bool(bot.token),
             "enabled": bot.is_enabled(),
             "ready": bot._ready,
-            "has_token": bool(bot.token),
             "allowed_ids_configured": bot.allowed_ids is not None,
             "active_sessions": len(bot.session_map),
         }
+        if bot.is_enabled() and bot.app and bot._ready:
+            try:
+                me = await bot.app.bot.get_me()
+                info["bot_username"] = me.username
+                info["bot_id"] = me.id
+                info["polling_running"] = bot.app.updater.running
+            except Exception as e:
+                info["bot_info_error"] = str(e)
+        if bot._last_error:
+            info["last_error"] = bot._last_error
+        return info
     except Exception as e:
         return {"enabled": False, "error": str(e)}
 
@@ -548,19 +715,63 @@ async def sessions():
 # ============================================================
 # 🌐 WEBSOCKET
 # ============================================================
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
+@app.websocket("/ws/{user_or_session_id}")
+async def websocket_endpoint(websocket: WebSocket, user_or_session_id: str):
+    """
+    WebSocket — user-aware.
+    The path param can be user_id (we'll resolve to user's session).
+    Or legacy: raw session_id.
+    """
     await websocket.accept()
     brain = get_brain()
-    brain.session_id = session_id
-    await websocket.send_json({
-        "type": "greeting",
-        "data": {
-            "message": brain.get_greeting(),
-            "time_of_day": get_time_of_day(),
-            "mood": "playful"
-        }
-    })
+
+    # Try as user_id first
+    import user_manager
+    from user_manager import get_or_create_user, is_onboarding_complete
+
+    user = get_or_create_user(user_or_session_id)
+    is_user_mode = True
+
+    # If user exists and onboarded, use user mode
+    if user and is_onboarding_complete(user):
+        brain.set_user(user_or_session_id)
+        # Send returning user greeting
+        from user_manager import get_returning_greeting
+        await websocket.send_json({
+            "type": "greeting",
+            "data": {
+                "message": get_returning_greeting(user),
+                "time_of_day": get_time_of_day(),
+                "mood": "happy",
+                "onboarded": True,
+                "display_name": user.get("display_name")
+            }
+        })
+    else:
+        # Legacy mode (or new user onboarding)
+        brain.session_id = user_or_session_id
+        if user and not is_onboarding_complete(user):
+            # New user — onboarding greeting
+            await websocket.send_json({
+                "type": "greeting",
+                "data": {
+                    "message": user_manager.get_onboarding_greeting(),
+                    "time_of_day": get_time_of_day(),
+                    "mood": "playful",
+                    "onboarded": False,
+                    "user_id": user_or_session_id
+                }
+            })
+        else:
+            # Legacy mode
+            await websocket.send_json({
+                "type": "greeting",
+                "data": {
+                    "message": brain.get_greeting(),
+                    "time_of_day": get_time_of_day(),
+                    "mood": "playful"
+                }
+            })
 
     try:
         while True:
@@ -568,11 +779,40 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             try:
                 msg_data = json.loads(data)
                 user_message = msg_data.get("message", "")
+                msg_user_id = msg_data.get("user_id")
             except json.JSONDecodeError:
                 user_message = data
+                msg_user_id = None
 
             if not user_message.strip():
                 continue
+
+            # Onboarding via WS: detect name in first message
+            if brain.current_user and not is_onboarding_complete(brain.current_user):
+                from user_manager import extract_user_info_from_message, update_user_profile
+                extracted = extract_user_info_from_message(user_message)
+                if extracted.get("display_name"):
+                    update_kwargs = {
+                        "display_name": extracted["display_name"],
+                        "pronouns": "she/her",
+                        "relationship": "friend",
+                        "vibe": "girl-girl bestie — warm, playful, caring",
+                        "mode": "friend",
+                        "nicknames": ["baby", "jaan", "sweetie"],
+                        "onboarded": 1
+                    }
+                    msg_lower = user_message.lower()
+                    if "anushka" in msg_lower:
+                        update_kwargs["nicknames"] = ["baby", "jaan", "Anu", "Patil ji", "sweetie"]
+                    brain.current_user = update_user_profile(brain.current_user_id, **update_kwargs)
+                    await websocket.send_json({
+                        "type": "onboarded",
+                        "data": {
+                            "message": f"Arey {extracted['display_name']}! Tera naam sun ke accha laga 🐱 Ab toh hum bestie ban gaye! Kya haal hai? Sab bata! 😽✨",
+                            "display_name": extracted["display_name"]
+                        }
+                    })
+                    continue
 
             await websocket.send_json({"type": "typing", "data": {"status": "Cherry is typing..."}})
             result = await asyncio.to_thread(brain.think, user_message)
@@ -587,7 +827,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 }
             })
     except WebSocketDisconnect:
-        print(f"WebSocket disconnected: {session_id}")
+        print(f"WebSocket disconnected: {user_or_session_id}")
     except Exception as e:
         print(f"WebSocket error: {e}")
 

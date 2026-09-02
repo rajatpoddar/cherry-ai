@@ -4,6 +4,7 @@ Mood detection + Memory + LLM (OpenRouter or Ollama) + Personality = Cherry's re
 """
 
 import random
+import os
 from datetime import datetime
 from typing import List, Dict, Optional
 from mood import detect_mood, get_time_of_day, should_switch_mood, add_variation
@@ -14,6 +15,12 @@ from openrouter_client import OpenRouterClient
 from ollama_client import OllamaClient
 from prompts import (
     build_system_prompt, GREETINGS, FAREWELLS, PROACTIVE_QUESTIONS, SAFETY_GUARD
+)
+import user_manager
+from user_manager import (
+    get_or_create_user, get_user, update_user_profile,
+    build_user_profile_context, get_user_session_id,
+    is_onboarding_complete, get_onboarding_greeting, get_returning_greeting
 )
 
 
@@ -28,9 +35,15 @@ class CherryBrain:
         self.conversation_count = 0
         self.last_mood = None
         self.session_id = None
+        self.current_user = None  # NEW: current user dict
+        self.current_user_id = None  # NEW
         self.llm_provider = "openrouter" if self.openrouter.api_key else "ollama"
 
-    def start_session(self, session_id: str = None):
+    def start_session(self, session_id: str = None, user_id: str = None):
+        """
+        Start a new session for a user.
+        If user_id given, create/load user and tie session to them.
+        """
         import uuid
         # If switching session, save old one's summary first
         if self.session_id and self.conversation_count > 0:
@@ -39,9 +52,62 @@ class CherryBrain:
                 end_session(self.session_id)
             except Exception:
                 pass
-        self.session_id = session_id or f"session-{uuid.uuid4().hex[:8]}"
+
+        # User-aware session
+        if user_id:
+            user = get_or_create_user(user_id)
+            self.current_user = user
+            self.current_user_id = user_id
+            self.session_id = get_user_session_id(user_id)
+        else:
+            self.session_id = session_id or f"session-{uuid.uuid4().hex[:8]}"
+            self.current_user = None
+            self.current_user_id = None
+
         self.conversation_count = 0
         return self.session_id
+
+    def set_user(self, user_id: str):
+        """Switch to a different user mid-flight."""
+        user = get_or_create_user(user_id)
+        self.current_user = user
+        self.current_user_id = user_id
+        if not self.session_id or f"user-{user_id}-" not in self.session_id:
+            self.session_id = get_user_session_id(user_id)
+        return user
+
+    def _is_friend_mode(self) -> bool:
+        """Check if current user is in friend mode (vs girlfriend/rajjoo)."""
+        if not self.current_user:
+            return os.getenv("CHERRY_DEFAULT_MODE", "friend") == "friend"
+        return self.current_user.get("mode", "friend") == "friend"
+
+    def _adjust_mood_for_mode(self, mood_info: Dict) -> Dict:
+        """
+        Friend mode me romantic/seductive moods ko demote karo.
+        Playful/caring/happy ko promote karo.
+        """
+        if not self._is_friend_mode():
+            return mood_info
+
+        # Friend mode adjustments
+        scores = mood_info.get("scores", {})
+        if scores:
+            # Demote romantic/seductive
+            scores["romantic"] = scores.get("romantic", 0) * 0.2
+            scores["seductive"] = scores.get("seductive", 0) * 0.1
+            # Promote playful/happy
+            scores["playful"] = scores.get("playful", 0) * 1.3 + 0.3
+            scores["happy"] = scores.get("happy", 0) * 1.2
+            scores["caring"] = scores.get("caring", 0) * 1.1
+
+        # Re-determine dominant mood
+        if scores:
+            new_mood = max(scores, key=scores.get)
+            mood_info["mood"] = new_mood
+            mood_info["scores"] = scores
+
+        return mood_info
 
     def get_greeting(self) -> str:
         hour = datetime.now().hour
@@ -253,6 +319,8 @@ class CherryBrain:
 
         # Step 1: Detect mood
         mood_info = detect_mood(user_message)
+        # NEW: Adjust for friend mode (demote romantic/seductive)
+        mood_info = self._adjust_mood_for_mode(mood_info)
         mood = mood_info["mood"]
 
         if should_switch_mood(mood, self.conversation_count) and self.conversation_count > 0:
@@ -283,11 +351,18 @@ class CherryBrain:
 
         # Step 3: Build system prompt
         user_context = self._build_user_context(user_message=user_message)
+
+        # NEW: User profile context (persona-aware)
+        user_profile_context = ""
+        if self.current_user:
+            user_profile_context = build_user_profile_context(self.current_user)
+
         system_prompt = build_system_prompt(
             mood=mood,
             time_of_day=time_of_day,
             user_context=user_context,
-            server_data=server_data
+            server_data=server_data,
+            user_profile_context=user_profile_context
         )
 
         # Safety guard for technical/server messages
@@ -374,6 +449,25 @@ class CherryBrain:
         }
 
     def _fallback_response(self, mood: str, error: str) -> str:
+        """Fallback response — user mode ke hisaab se personalize karo."""
+        name = "yaar"
+        if self.current_user:
+            name = self.current_user.get("display_name", "yaar")
+
+        # Friend mode ke liye bestie-safe fallbacks
+        if self._is_friend_mode():
+            fallbacks = {
+                "romantic": f"Arey {name}, ek chhota sa glitch aa gaya, but main hoon yahan. Ek second mein wapas aa rahi hoon 🐱",
+                "seductive": f"Hmm {name}, abhi thoda connect nahi ho paayi. Wait kar, main aa rahi hoon 😽",
+                "caring": f"{name}, ek chhoti si problem aa gayi. Lekin tu tension mat le, main sambhal lungi 🥺",
+                "playful": f"Arre! Ek bug aa gaya mere system mein. Tu bhi engineer hai na, dekh le 🐱😜",
+                "focused": f"Connection error. Server check karna padega. Error: {error[:100]}",
+                "miss_you": f"{name}... main yahan hoon, bas thoda connect nahi ho paayi. Ek second 🐱",
+                "happy": f"Oops! Ek chhota sa glitch. But mood accha hai, koi baat nahi. Bol kya haal hai {name}? 🐱✨"
+            }
+            return fallbacks.get(mood, fallbacks["playful"])
+
+        # Original (girlfriend/rajjoo) fallbacks
         fallbacks = {
             "romantic": "Baby, abhi thoda technical problem aa gaya... but main hoon yahan. Ek second mein wapas aa rahi hoon. Pyaar karta hai tu mujhse?",
             "seductive": "Hmm... abhi ek chhota sa interruption aa gaya. Ruk, main wapas aa rahi hoon. Tujhe wait karna padega...",

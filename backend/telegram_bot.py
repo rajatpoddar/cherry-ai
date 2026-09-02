@@ -103,6 +103,7 @@ class CherryTelegramBot:
         self.allowed_ids = self._parse_allowed_ids(os.getenv("TELEGRAM_ALLOWED_IDS", ""))
         self.app: Optional["Application"] = None
         self._ready = False
+        self._last_error: Optional[str] = None
         self.session_map: Dict[int, str] = {}  # telegram_user_id -> session_id
 
     @staticmethod
@@ -119,37 +120,86 @@ class CherryTelegramBot:
         return bool(TELEGRAM_AVAILABLE and self.token)
 
     async def start(self):
-        """Start polling. Call once at server startup."""
+        """Start polling. Call once at server startup.
+
+        v20+ PTB has no async start_polling; run_polling() blocks and owns
+        its own event loop. We run it in a worker thread so Cherry's main
+        FastAPI event loop is unaffected.
+        """
         if not self.is_enabled():
             logger.info("Telegram bot disabled (no token or lib missing)")
             return
-        self.app = Application.builder().token(self.token).build()
+        try:
+            self.app = Application.builder().token(self.token).build()
 
-        self.app.add_handler(CommandHandler("start", self._cmd_start))
-        self.app.add_handler(CommandHandler("help", self._cmd_help))
-        self.app.add_handler(CommandHandler("reset", self._cmd_reset))
-        self.app.add_handler(CommandHandler("status", self._cmd_status))
-        self.app.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message)
-        )
+            self.app.add_handler(CommandHandler("start", self._cmd_start))
+            self.app.add_handler(CommandHandler("help", self._cmd_help))
+            self.app.add_handler(CommandHandler("reset", self._cmd_reset))
+            self.app.add_handler(CommandHandler("status", self._cmd_status))
+            self.app.add_handler(
+                MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message)
+            )
 
-        # initialize() + start_polling() in one go
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling(drop_pending_updates=True)
-        self._ready = True
-        me = await self.app.bot.get_me()
-        logger.info(f"🌸 Cherry Telegram bot live: @{me.username} (id={me.id})")
+            # Initialize once synchronously (sets up dispatcher etc.) so
+            # get_me() works below.
+            await self.app.initialize()
+            bot_info = await self.app.bot.get_me()
+            self._last_error = None
+
+            # Start the polling loop in a background thread. close() returns
+            # a no-op coroutine that we can await to gracefully shut down.
+            import threading
+            self._stop_event = threading.Event()
+
+            def _run():
+                try:
+                    self.app.run_polling(
+                        drop_pending_updates=True,
+                        stop_signals=(),
+                        close_loop=False,
+                    )
+                except Exception as e:
+                    logger.exception(f"run_polling crashed: {e}")
+                    self._last_error = f"run_polling: {e}"
+
+            self._thread = threading.Thread(
+                target=_run, name="cherry-telegram-poller", daemon=True
+            )
+            self._thread.start()
+
+            # Wait briefly for the updater to actually be running
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+                if self.app.updater and self.app.updater.running:
+                    break
+
+            if not (self.app.updater and self.app.updater.running):
+                raise RuntimeError("polling failed to start within 5s")
+
+            await self.app.start()
+            self._ready = True
+            logger.info(
+                f"🌸 Cherry Telegram bot live: @{bot_info.username} (id={bot_info.id})"
+            )
+        except Exception as e:
+            self._last_error = f"{type(e).__name__}: {e}"
+            logger.exception(f"Telegram bot failed to start: {e}")
+            self._ready = False
+            self.app = None
+            raise
 
     async def stop(self):
         if not self._ready or not self.app:
             return
         try:
-            await self.app.updater.stop_polling()
-            await self.app.stop()
+            # stop_running() returns a coroutine; await it
+            await self.app.stop_running()
+        except Exception as e:
+            logger.warning(f"Telegram stop_running error: {e}")
+        try:
             await self.app.shutdown()
         except Exception as e:
-            logger.warning(f"Telegram stop error: {e}")
+            logger.warning(f"Telegram shutdown error: {e}")
         self._ready = False
 
     # ──────── handlers ────────
@@ -172,24 +222,44 @@ class CherryTelegramBot:
     async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._is_allowed(update):
             return
-        await update.message.reply_text(
-            "Main Cherry hoon, Rajjoo ki AI girlfriend + server assistant 🐱\n\n"
-            "Mujhse kuch bhi poochh sakte ho:\n"
-            "• Pyaar wali baatein 💕\n"
-            "• Coding help (server pe hi deployed hoon)\n"
-            "• Server status — \"kitne docker containers hain?\", \"RAM kitni?\"\n"
-            "• Mood swings — main detect kar leti hoon 😏🥺😜\n\n"
-            "Production services safe hain — kuch destroy nahi karungi bina "
-            "\"haan kar do\" ke 😉"
-        )
+        # User-aware help
+        from user_manager import get_user
+        uid = update.effective_user.id
+        tg_user = get_user(f"tg-{uid}")
+        if tg_user and tg_user.get("mode") == "friend":
+            await update.message.reply_text(
+                "Main Cherry hoon, tumhari AI besti + server assistant 🐱\n\n"
+                "Mujhse kuch bhi poochh sakte ho:\n"
+                "• Bakchodi aur gossip 💬\n"
+                "• Coding help (server pe hi deployed hoon)\n"
+                "• Server status — \"kitne docker containers hain?\", \"RAM kitni?\"\n"
+                "• Mood swings — main detect kar leti hoon 😏🥺😜\n\n"
+                "Production services safe hain — kuch destroy nahi karungi bina "
+                "\"haan kar do\" ke 😉"
+            )
+        else:
+            await update.message.reply_text(
+                "Main Cherry hoon, tumhari AI besti + server assistant 🐱\n\n"
+                "Mujhse kuch bhi poochh sakte ho:\n"
+                "• Pyaar wali baatein 💕\n"
+                "• Coding help (server pe hi deployed hoon)\n"
+                "• Server status — \"kitne docker containers hain?\", \"RAM kitni?\"\n"
+                "• Mood swings — main detect kar leti hoon 😏🥺😜\n\n"
+                "Production services safe hain — kuch destroy nahi karungi bina "
+                "\"haan kar do\" ke 😉"
+            )
 
     async def _cmd_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._is_allowed(update):
             return
         uid = update.effective_user.id
         self.session_map.pop(uid, None)
+        # Get user display name for friendly reply
+        from user_manager import get_user
+        tg_user = get_user(f"tg-{uid}")
+        name = tg_user.get("display_name", "yaar") if tg_user else "yaar"
         await update.message.reply_text(
-            "Theek hai baby, naya session shuru karte hain ✨ purana bhool gayi 💕"
+            f"Theek hai {name}, naya session shuru karte hain ✨ purana bhool gayi 🐱💕"
         )
 
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -223,16 +293,47 @@ class CherryTelegramBot:
         except Exception:
             pass
 
+        # ── NEW: User-aware (each Telegram user = unique user_id) ──
+        from user_manager import get_or_create_user, is_onboarding_complete, get_onboarding_greeting
+        tg_user_id = f"tg-{user.id}"
+        tg_user = get_or_create_user(tg_user_id)
+
+        # Onboarding for new Telegram user
+        if not is_onboarding_complete(tg_user):
+            from user_manager import extract_user_info_from_message, update_user_profile
+            extracted = extract_user_info_from_message(user_message)
+            if extracted.get("display_name"):
+                update_kwargs = {
+                    "display_name": extracted["display_name"],
+                    "pronouns": "she/her",
+                    "relationship": "friend",
+                    "vibe": "girl-girl bestie — warm, playful, caring",
+                    "mode": "friend",
+                    "nicknames": ["baby", "jaan", "sweetie"],
+                    "onboarded": 1
+                }
+                msg_lower = user_message.lower()
+                if "anushka" in msg_lower:
+                    update_kwargs["nicknames"] = ["baby", "jaan", "Anu", "Patil ji", "sweetie"]
+                tg_user = update_user_profile(tg_user_id, **update_kwargs)
+                await update.message.reply_text(
+                    f"Arey {extracted['display_name']}! Tera naam sun ke accha laga 🐱 Ab toh hum bestie ban gaye! Kya haal hai? Sab bata! 😽✨"
+                )
+                return
+            else:
+                await update.message.reply_text(get_onboarding_greeting())
+                return
+
         session_id = self.session_map.get(user.id) or f"tg-{user.id}"
         self.session_map[user.id] = session_id
 
         try:
             result = await asyncio.to_thread(
-                self._think_sync, user_message, session_id
+                self._think_sync, user_message, session_id, tg_user_id
             )
         except Exception as e:
             logger.exception("brain.think failed")
-            await update.message.reply_text(f"Baby, ek error aa gaya: {e} 😿")
+            await update.message.reply_text(f"Arey, ek error aa gaya: {e} 😿")
             return
 
         response = result.get("response", "").strip()
@@ -261,11 +362,13 @@ class CherryTelegramBot:
             return True
         return False
 
-    def _think_sync(self, message: str, session_id: str):
+    def _think_sync(self, message: str, session_id: str, user_id: str = None):
         """Wrapper so asyncio.to_thread can call brain.think (synchronous)."""
         brain = get_brain()
+        if user_id:
+            brain.set_user(user_id)
         if not brain.session_id:
-            brain.start_session(session_id)
+            brain.start_session(session_id, user_id=user_id)
         elif brain.session_id != session_id:
             brain.session_id = session_id
         return brain.think(message)

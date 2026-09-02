@@ -28,15 +28,36 @@ const MOOD_EMOJI: Record<string, string> = {
 
 const STORAGE_KEY = "cherry_chat_history_v1";
 const SESSION_KEY = "cherry_session_id_v1";
+const USER_ID_KEY = "cherry_user_id_v1";
+const USER_NAME_KEY = "cherry_user_name_v1";
 
-function getOrCreateSessionId(): string {
-  if (typeof window === "undefined") return "web-ssr";
-  let sid = localStorage.getItem(SESSION_KEY);
-  if (!sid) {
-    sid = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    localStorage.setItem(SESSION_KEY, sid);
+/**
+ * Device-stable user identifier.
+ * Same browser/device = same user_id (so Cherry recognizes returning users).
+ * First visit: creates a new user_id, user starts onboarding.
+ * Returns array: [userId, displayName]
+ */
+function getOrCreateUserId(): [string, string | null] {
+  if (typeof window === "undefined") return ["web-ssr", null];
+  let uid = localStorage.getItem(USER_ID_KEY);
+  let name = localStorage.getItem(USER_NAME_KEY);
+  if (!uid) {
+    // Generate stable device ID
+    uid = `web-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    localStorage.setItem(USER_ID_KEY, uid);
   }
-  return sid;
+  return [uid, name];
+}
+
+function setUserName(name: string) {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(USER_NAME_KEY, name);
+}
+
+// Legacy compat
+function getOrCreateSessionId(): string {
+  const [uid] = getOrCreateUserId();
+  return uid;
 }
 
 function loadLocalMessages(): Message[] {
@@ -68,6 +89,9 @@ export default function CherryChat() {
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
   const [showServer, setShowServer] = useState(false);
   const [sessionId, setSessionId] = useState<string>("web-ssr");
+  const [userId, setUserId] = useState<string>("web-ssr");
+  const [userName, setUserNameState] = useState<string | null>(null);
+  const [onboarded, setOnboarded] = useState<boolean>(true);
   const [hydrated, setHydrated] = useState(false);
   const [showJumpButton, setShowJumpButton] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -77,23 +101,25 @@ export default function CherryChat() {
   const lastScrollTop = useRef<number>(0);
   const isAtBottomRef = useRef<boolean>(true);
 
-  // 1. Hydrate session id and local history on first client render
+  // 1. Hydrate user id and local history on first client render
   useEffect(() => {
-    const sid = getOrCreateSessionId();
-    setSessionId(sid);
+    const [uid, name] = getOrCreateUserId();
+    setUserId(uid);
+    setSessionId(uid);
+    if (name) setUserNameState(name);
     const local = loadLocalMessages();
     if (local.length > 0) setMessages(local);
     setHydrated(true);
   }, []);
 
-  // 2. After hydration, fetch server history for the stable session
+  // 2. After hydration, fetch server history for the stable user
   useEffect(() => {
-    if (!hydrated || !sessionId || sessionId === "web-ssr") return;
-    loadHistoryFromServer(sessionId);
+    if (!hydrated || !userId || userId === "web-ssr") return;
+    loadHistoryFromServer(userId);
     loadServerStatus();
     if (messages.length === 0) loadGreeting();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrated, sessionId]);
+  }, [hydrated, userId]);
 
   // 3. Persist to localStorage on every change (after hydration)
   useEffect(() => {
@@ -138,10 +164,10 @@ export default function CherryChat() {
     }
   }, [messages, loading, hydrated, historyLoading, scrollToBottom]);
 
-  async function loadHistoryFromServer(sid: string) {
+  async function loadHistoryFromServer(uid: string) {
     setHistoryLoading(true);
     try {
-      const r = await fetch(`/api/chat/history?session_id=${encodeURIComponent(sid)}&limit=100`);
+      const r = await fetch(`/api/chat/history?user_id=${encodeURIComponent(uid)}&limit=100`);
       if (!r.ok) return;
       const d = await r.json();
       const serverMsgs: Message[] = (d.messages || []).map((m: any) => ({
@@ -166,8 +192,14 @@ export default function CherryChat() {
 
   async function loadGreeting() {
     try {
-      const r = await fetch("/api/greeting");
+      const r = await fetch(`/api/greeting?user_id=${encodeURIComponent(userId)}`);
       const d = await r.json();
+      // Track onboarding status
+      if (typeof d.onboarded === "boolean") setOnboarded(d.onboarded);
+      if (d.display_name) {
+        setUserName(d.display_name);
+        setUserNameState(d.display_name);
+      }
       const greetingMsg: Message = {
         role: "cherry",
         content: d.greeting,
@@ -177,7 +209,7 @@ export default function CherryChat() {
       setMessages([greetingMsg]);
       setTimeOfDay(d.time_of_day);
     } catch {
-      setMessages([{ role: "cherry", content: "Hey baby! Main hoon yahan 💕" }]);
+      setMessages([{ role: "cherry", content: "Hey besti! Main hoon yahan 🐱" }]);
     }
   }
 
@@ -206,9 +238,21 @@ export default function CherryChat() {
       const r = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: userMsg, session_id: sessionId }),
+        body: JSON.stringify({
+          message: userMsg,
+          user_id: userId,
+          session_id: sessionId,
+        }),
       });
       const d = await r.json();
+
+      // Onboarding handling
+      if (typeof d.onboarded === "boolean") setOnboarded(d.onboarded);
+      if (d.display_name) {
+        setUserName(d.display_name);
+        setUserNameState(d.display_name);
+      }
+
       setMessages((m) => [
         ...m,
         { role: "cherry", content: d.response, mood: d.mood, time_of_day: d.time_of_day },
@@ -218,7 +262,7 @@ export default function CherryChat() {
     } catch {
       setMessages((m) => [
         ...m,
-        { role: "cherry", content: "Baby, ek chhota sa issue aa gaya... ek second me try kar 💕" },
+        { role: "cherry", content: "Arey ek chhota sa issue aa gaya... ek second me try kar 🐱" },
       ]);
     } finally {
       setLoading(false);
@@ -355,7 +399,7 @@ export default function CherryChat() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKey}
-            placeholder="Cherry se baat kar..."
+            placeholder={userName ? `${userName}, Cherry se baat kar...` : "Cherry se baat kar..."}
             className="flex-1 glass px-4 py-3 rounded-full text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cherry-pink/50"
             disabled={loading}
           />
@@ -368,7 +412,8 @@ export default function CherryChat() {
           </button>
         </div>
         <p className="text-center text-xs text-gray-500 mt-2">
-          🐱 Cherry se pyaar se baat kar besti
+          🐱 {userName ? `Cherry × ${userName}` : "Cherry se pyaar se baat kar besti"}
+          {!onboarded && " · pehle apna naam bata 😉"}
         </p>
       </div>
     </div>
