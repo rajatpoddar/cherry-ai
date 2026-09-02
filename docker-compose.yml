@@ -14,15 +14,27 @@ services:
     container_name: cherry-backend
     restart: unless-stopped
     network_mode: host
+    # CHERRY_LOCAL=1 means: run commands directly on the host (no SSH),
+    # because the backend container shares the host's PID/network namespace
+    # via network_mode: host AND can see the host's processes/docker via mounts.
+    user: "0:0"  # run as root so docker.sock + host /proc are accessible
     volumes:
       - ./data:/app/data          # SQLite memory persists
       - ./logs:/app/logs
       - /etc/localtime:/etc/localtime:ro
+      # Mount host docker socket so cherry can run `docker ps`, `docker stats`,
+      # etc. against the NAS docker daemon (the same one running herself).
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount host /proc so free/meminfo/nproc reflect the host, not this
+      # container. Read-only is fine.
+      - /proc:/host-proc:ro
     env_file:
       - .env
     environment:
       - CHERRY_HOST=0.0.0.0
       - CHERRY_PORT=3003
+      - CHERRY_LOCAL=1
+      - CHERRY_HOST_PROC=/host-proc
       # On NAS, Ollama runs on host. ${OLLAMA_HOST} is set in .env
       - OLLAMA_HOST=${OLLAMA_HOST:-http://localhost:11434}
     healthcheck:

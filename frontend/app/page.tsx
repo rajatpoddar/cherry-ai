@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
-import { Send, Server, Activity } from "lucide-react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { Send, Server, Activity, ArrowDown, Trash2 } from "lucide-react";
 
 type Message = {
   role: "user" | "cherry";
@@ -26,6 +26,39 @@ const MOOD_EMOJI: Record<string, string> = {
   happy: "🌸",
 };
 
+const STORAGE_KEY = "cherry_chat_history_v1";
+const SESSION_KEY = "cherry_session_id_v1";
+
+function getOrCreateSessionId(): string {
+  if (typeof window === "undefined") return "web-ssr";
+  let sid = localStorage.getItem(SESSION_KEY);
+  if (!sid) {
+    sid = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    localStorage.setItem(SESSION_KEY, sid);
+  }
+  return sid;
+}
+
+function loadLocalMessages(): Message[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalMessages(msgs: Message[]) {
+  if (typeof window === "undefined") return;
+  try {
+    const trimmed = msgs.slice(-200);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
+  } catch {}
+}
+
 export default function CherryChat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -34,23 +67,114 @@ export default function CherryChat() {
   const [timeOfDay, setTimeOfDay] = useState("afternoon");
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
   const [showServer, setShowServer] = useState(false);
-  const [sessionId] = useState(`web-${Date.now()}`);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const [sessionId, setSessionId] = useState<string>("web-ssr");
+  const [hydrated, setHydrated] = useState(false);
+  const [showJumpButton, setShowJumpButton] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [historyLoading, setHistoryLoading] = useState(false);
 
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const lastScrollTop = useRef<number>(0);
+  const isAtBottomRef = useRef<boolean>(true);
+
+  // 1. Hydrate session id and local history on first client render
   useEffect(() => {
-    loadGreeting();
-    loadServerStatus();
+    const sid = getOrCreateSessionId();
+    setSessionId(sid);
+    const local = loadLocalMessages();
+    if (local.length > 0) setMessages(local);
+    setHydrated(true);
   }, []);
 
+  // 2. After hydration, fetch server history for the stable session
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, loading]);
+    if (!hydrated || !sessionId || sessionId === "web-ssr") return;
+    loadHistoryFromServer(sessionId);
+    loadServerStatus();
+    if (messages.length === 0) loadGreeting();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated, sessionId]);
+
+  // 3. Persist to localStorage on every change (after hydration)
+  useEffect(() => {
+    if (hydrated) saveLocalMessages(messages);
+  }, [messages, hydrated]);
+
+  // 4. Smart scroll handler: track if user is near bottom
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = distanceFromBottom < 80;
+    isAtBottomRef.current = atBottom;
+    if (el.scrollTop < lastScrollTop.current && !atBottom) {
+      setShowJumpButton(true);
+    }
+    if (atBottom) {
+      setShowJumpButton(false);
+      setUnreadCount(0);
+    }
+    lastScrollTop.current = el.scrollTop;
+  }, []);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+  }, []);
+
+  // 5. Auto-scroll only when user is already at bottom
+  useEffect(() => {
+    if (!hydrated) return;
+    if (isAtBottomRef.current) {
+      scrollToBottom("smooth");
+      setUnreadCount(0);
+    } else {
+      setUnreadCount((c) => c + 1);
+      setShowJumpButton(true);
+    }
+    if (historyLoading) {
+      requestAnimationFrame(() => scrollToBottom("auto"));
+    }
+  }, [messages, loading, hydrated, historyLoading, scrollToBottom]);
+
+  async function loadHistoryFromServer(sid: string) {
+    setHistoryLoading(true);
+    try {
+      const r = await fetch(`/api/chat/history?session_id=${encodeURIComponent(sid)}&limit=100`);
+      if (!r.ok) return;
+      const d = await r.json();
+      const serverMsgs: Message[] = (d.messages || []).map((m: any) => ({
+        role: m.role === "user" ? "user" : "cherry",
+        content: m.content,
+        mood: m.mood,
+        time_of_day: m.time_of_day,
+      }));
+      if (serverMsgs.length > 0) {
+        setMessages((existing) => {
+          const seen = new Set(serverMsgs.map((m) => `${m.role}::${m.content}`));
+          const localOnly = existing.filter((m) => !seen.has(`${m.role}::${m.content}`));
+          return [...serverMsgs, ...localOnly];
+        });
+      }
+    } catch (e) {
+      console.warn("History fetch failed (using local):", e);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
 
   async function loadGreeting() {
     try {
       const r = await fetch("/api/greeting");
       const d = await r.json();
-      setMessages([{ role: "cherry", content: d.greeting, mood: d.mood, time_of_day: d.time_of_day }]);
+      const greetingMsg: Message = {
+        role: "cherry",
+        content: d.greeting,
+        mood: d.mood,
+        time_of_day: d.time_of_day,
+      };
+      setMessages([greetingMsg]);
       setTimeOfDay(d.time_of_day);
     } catch {
       setMessages([{ role: "cherry", content: "Hey baby! Main hoon yahan 💕" }]);
@@ -64,6 +188,12 @@ export default function CherryChat() {
     } catch (e) {
       console.error("Server status failed:", e);
     }
+  }
+
+  function clearHistory() {
+    if (!confirm("Saari chat history delete karni hai? (local storage)")) return;
+    setMessages([]);
+    try { localStorage.removeItem(STORAGE_KEY); } catch {}
   }
 
   async function sendMessage() {
@@ -121,12 +251,21 @@ export default function CherryChat() {
             </p>
           </div>
         </div>
-        <button
-          onClick={() => setShowServer(!showServer)}
-          className="p-2 rounded-full glass hover:bg-white/10 transition"
-        >
-          <Server className="w-5 h-5 text-cherry-pink" />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={clearHistory}
+            title="Clear chat history"
+            className="p-2 rounded-full glass hover:bg-white/10 transition"
+          >
+            <Trash2 className="w-4 h-4 text-gray-400" />
+          </button>
+          <button
+            onClick={() => setShowServer(!showServer)}
+            className="p-2 rounded-full glass hover:bg-white/10 transition"
+          >
+            <Server className="w-5 h-5 text-cherry-pink" />
+          </button>
+        </div>
       </header>
 
       {showServer && serverStatus && (
@@ -160,7 +299,27 @@ export default function CherryChat() {
         </div>
       )}
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-3" style={{ paddingBottom: "100px" }}>
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto p-3 space-y-3 relative"
+        style={{ paddingBottom: "100px" }}
+      >
+        {showJumpButton && (
+          <button
+            onClick={() => {
+              isAtBottomRef.current = true;
+              setShowJumpButton(false);
+              setUnreadCount(0);
+              scrollToBottom("smooth");
+            }}
+            className="sticky top-2 z-10 mx-auto flex items-center gap-1 px-3 py-1.5 rounded-full bg-cherry-pink/90 hover:bg-cherry-pink text-white text-xs font-medium shadow-lg backdrop-blur transition slide-up"
+            aria-label="Jump to latest message"
+          >
+            <ArrowDown className="w-3 h-3" />
+            {unreadCount > 0 ? `${unreadCount} new` : "Latest"}
+          </button>
+        )}
         {messages.map((m, i) => (
           <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"} slide-up`}>
             <div

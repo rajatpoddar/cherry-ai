@@ -32,6 +32,60 @@ class ServerOps:
         # local mode: only if explicitly set OR if ssh_host == "local" / "127.0.0.1"
         explicit_local = ssh_host in (None,) and os.getenv("CHERRY_LOCAL") == "1"
         self.local = explicit_local or ssh_host in ("local", "127.0.0.1", "localhost")
+        # In container-with-host-mount mode, commands like `free`, `nproc`, `df`
+        # see the container's own /proc — which is useless for host stats.
+        # CHERRY_HOST_PROC points to the mounted host /proc (e.g. /host-proc).
+        # When set, we redirect those commands to read from the host procfs.
+        self.host_proc = os.getenv("CHERRY_HOST_PROC", "") if self.local else ""
+
+    def _host_command(self, command: str) -> str:
+        """
+        Rewrite a command so that, when running inside a container with
+        CHERRY_HOST_PROC mounted, it reports HOST (not container) stats.
+
+        - `free -h`       -> reads /proc/meminfo from host-proc
+        - `nproc`         -> counts host CPU cores from host-proc/cpuinfo
+        - `df -h`         -> works as-is (already queries mount points)
+        - `uptime`        -> reads host-proc/uptime + loadavg
+        - everything else -> unchanged
+        """
+        if not self.host_proc:
+            return command
+
+        cmd = command.strip()
+        lower = cmd.lower()
+
+        # free -h
+        if lower.startswith("free "):
+            return (
+                f"awk 'BEGIN{{print \"              total        used        free      shared  buff/cache   available\"}} "
+                f"/^MemTotal:/{{m=$2}} /^MemFree:/{{f=$2}} /^MemAvailable:/{{a=$2}} /^Buffers:/{{b=$2}} /^Cached:/{{c=$2}} "
+                f"END{{u=m-f-b-c; printf \"%-14s %10s %10s %10s %10s %10s %10s\\n\", \"Mem:\", m, u, f, b+c, a, \"\"; "
+                f"printf \"%-14s %10s %10s %10s\\n\", \"Swap:\", 0, 0, 0}}' "
+                f"{self.host_proc}/meminfo"
+            )
+
+        # nproc
+        if lower == "nproc" or lower.startswith("nproc "):
+            return f"grep -c ^processor {self.host_proc}/cpuinfo"
+
+        # uptime
+        if lower.startswith("uptime"):
+            up_file = f"{self.host_proc}/uptime"
+            load_file = f"{self.host_proc}/loadavg"
+            return (
+                f"awk -F. '{{printf \"up %d days, %d:%02d, \", $1/86400, ($1%86400)/3600, ($1%3600)/60}}' {up_file}; "
+                f"awk '{{printf \"load average: %s, %s, %s\\n\", $1, $2, $3}}' {load_file}"
+            )
+
+        # df -h
+        if lower.startswith("df "):
+            # df works against /proc/self/mountinfo; on the host's view we
+            # just need to drop the container's overlay mounts. Simplest:
+            # filter out the container's own rootfs (overlay on /).
+            return f"{command} -x overlay -x tmpfs -x devtmpfs 2>/dev/null || {command}"
+
+        return command
 
     def _is_blocked(self, command: str) -> bool:
         cmd_lower = command.lower()
@@ -74,7 +128,10 @@ class ServerOps:
 
         try:
             if self.local:
-                proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+                # If we're inside a container with host /proc mounted,
+                # rewrite host-stat commands to read from that mount.
+                effective_cmd = self._host_command(command)
+                proc = subprocess.run(effective_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
             else:
                 # SSH needs full PATH and proper shell. Use sudo for docker commands
                 # because rajat user doesn't have docker group access.
@@ -100,10 +157,51 @@ class ServerOps:
             return {"success": False, "error": str(e), "command": command}
 
     def docker_ps(self) -> Dict:
-        return self.execute_read('docker ps --format "table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"')
+        return self.execute_read('docker ps --format "table {{.Names}}\\t{{.Status}}\\t{{.Ports}}\\t{{.Image}}"')
 
     def docker_stats(self) -> Dict:
-        return self.execute_read('docker stats --no-stream --format "table {{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}"')
+        # `docker stats --no-stream` can fail with cgroup permission issues
+        # even when the socket is mounted. Try it first; if it returns no
+        # output, fall back to a table built from `docker inspect` (memory
+        # limit) + status — still useful for capacity planning.
+        r = self.execute_read(
+            'docker stats --no-stream --format "table {{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}\\t{{.MemPerc}}"'
+        )
+        if r.get("success") and r.get("output", "").strip():
+            return r
+
+        # Fallback: assemble stats from inspect
+        try:
+            ps = self.execute_read('docker ps --format "{{.Names}}"')
+            if not ps.get("success"):
+                return r
+            names = [n for n in ps["output"].splitlines() if n.strip()]
+            lines = ["NAME\tCPU%\tMEM_USAGE / LIMIT\tMEM%"]
+            for name in names:
+                inspect = self.execute_read(
+                    f"docker inspect --format "
+                    f"'{{{{.Name}}}}|{{{{.HostConfig.Memory}}}}|{{{{.State.Status}}}}' {name}"
+                )
+                mem = "n/a"
+                if inspect.get("success") and inspect["output"].strip():
+                    parts = inspect["output"].strip().split("|")
+                    if len(parts) >= 2 and parts[1] not in ("0", "", "<no value>"):
+                        try:
+                            limit_bytes = int(parts[1])
+                            limit_mb = limit_bytes / 1024 / 1024
+                            mem = f"n/a / {limit_mb:.0f}MiB"
+                        except Exception:
+                            pass
+                lines.append(f"{name}\tn/a\t{mem}\tn/a")
+            return {
+                "success": True,
+                "output": "\n".join(lines),
+                "error": "",
+                "command": "docker stats (fallback)",
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"success": False, "error": f"docker stats fallback failed: {e}", "command": "docker stats"}
 
     def docker_logs(self, container: str, lines: int = 50) -> Dict:
         if self._is_prod_service(container):
