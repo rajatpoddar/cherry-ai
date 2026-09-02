@@ -9,6 +9,7 @@ Cherry combines:
 - 🧠 **Coding agent** (Buffy role) — code help, debugging, architecture
 - 🛡️ **Server assistant** — safe Docker/SSH management with production safety
 - 💾 **Memory system** — remembers everything, learns from each chat
+- 📱 **Multi-platform** — Web UI (PWA) + Telegram bot (same brain, same memory)
 
 ---
 

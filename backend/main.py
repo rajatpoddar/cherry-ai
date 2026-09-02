@@ -53,8 +53,28 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"   .agents sync warning: {e}")
 
+    # Telegram bot (optional — auto-starts if TELEGRAM_BOT_TOKEN is set)
+    tg_bot = None
+    try:
+        from telegram_bot import get_telegram_bot
+        tg_bot = get_telegram_bot()
+        if tg_bot.is_enabled():
+            await tg_bot.start()
+            print(f"   Telegram: live (use /start in Telegram)")
+        else:
+            print("   Telegram: disabled (no TELEGRAM_BOT_TOKEN)")
+    except Exception as e:
+        print(f"   Telegram warning: {e}")
+
     print("✅ Cherry ready!")
     yield
+
+    # Telegram bot shutdown
+    if tg_bot is not None:
+        try:
+            await tg_bot.stop()
+        except Exception as e:
+            print(f"   Telegram stop warning: {e}")
 
     # NEW: On shutdown, end current session with summary
     try:
@@ -450,6 +470,23 @@ async def server_status():
         "ollama": ops.ollama_status(),
         "production_health": ops.check_production_health()
     }
+
+
+@app.get("/telegram/status")
+async def telegram_status():
+    """Health check for the Telegram bridge."""
+    try:
+        from telegram_bot import get_telegram_bot
+        bot = get_telegram_bot()
+        return {
+            "enabled": bot.is_enabled(),
+            "ready": bot._ready,
+            "has_token": bool(bot.token),
+            "allowed_ids_configured": bot.allowed_ids is not None,
+            "active_sessions": len(bot.session_map),
+        }
+    except Exception as e:
+        return {"enabled": False, "error": str(e)}
 
 
 @app.get("/server/docker/ps")
