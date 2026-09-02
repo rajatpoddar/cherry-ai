@@ -1,0 +1,18 @@
+{
+  "name": "Cherry — Personal AI",
+  "short_name": "Cherry",
+  "description": "Mood-aware AI girlfriend + server assistant",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0f",
+  "theme_color": "#FF6B9D",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+# 🌸 Cherry — Docker Compose
+# Run from /Users/rajatpoddar/Developer/development/mybuffy/cherry
+# Usage: docker compose up -d
+
+version: '3.8'
+
+services:
+  cherry-backend:
+    build: ./backend
+    container_name: cherry-backend
+    restart: unless-stopped
+    ports:
+      - "3003:3003"
+    volumes:
+      - ./data:/app/data          # SQLite memory persists
+      - ./logs:/app/logs
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - .env
+    environment:
+      - CHERRY_HOST=0.0.0.0
+      - CHERRY_PORT=3003
+      # On NAS, use localhost Ollama
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3003/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - cherry-net
+    # For NAS: use host network so Docker can reach Ollama on host
+    # network_mode: host  # uncomment for NAS deploy
+
+  cherry-frontend:
+    build: ./frontend
+    container_name: cherry-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    depends_on:
+      cherry-backend:
+        condition: service_healthy
+    networks:
+      - cherry-net
+
+networks:
+  cherry-net:
+    driver: bridge

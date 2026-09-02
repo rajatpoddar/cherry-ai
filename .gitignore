@@ -1,0 +1,53 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# SQLite databases
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Node.js / Next.js
+node_modules/
+.next/
+out/
+.vercel/
+
+# Logs
+logs/*.log
+logs/
+
+# PID files
+.pids/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docker
+docker-compose.override.yml
+
+# Misc
+*.bak
+*.tmp
